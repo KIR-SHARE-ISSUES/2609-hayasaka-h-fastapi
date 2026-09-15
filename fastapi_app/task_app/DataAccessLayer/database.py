@@ -1,134 +1,136 @@
-"""データベース接続と環境設定を管理する場所。
+"""DBの接続設定と、処理ごとのSession管理をまとめる。
 
-- .envファイルからデータベース設定とCORS設定を読み込む。
-- MySQLへ接続するためのEngineを作成する。
-- データベース操作に使用するSessionLocalを作成する。
-- 各モデルの基底クラスとなるBaseを定義する。
+Engineは接続を管理し、Sessionは個々の検索・変更を管理する。
+Sessionの準備・実行・保存・取り消し・終了は、末尾の共通関数で行う。
 """
 
-# 一度作成した設定オブジェクトをキャッシュするために使用する。
-from functools import lru_cache
-
-# OSに依存しない方法でファイルパスを操作するために使用する。
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
-# SQLAlchemyの接続URLとEngineを作成する機能を読み込む。
-from sqlalchemy import URL, create_engine
-
-# モデルの基底クラスとセッション作成機能を読み込む。
-from sqlalchemy.orm import DeclarativeBase, sessionmaker
-
-# .envファイルから設定値を読み込む機能を読み込む。
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import URL, Engine, create_engine
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+from ..Model.errors import PersistenceError
+
+Result = TypeVar("Result")
 
 
-# .envファイルから読み込む設定項目を定義する。
 class Settings(BaseSettings):
+    """環境変数・.envから接続先とCORS設定を読み、形式を検証する。DBの実在は確認しない。"""
 
-    # データベースの接続情報を受け取る。
+    # 初期値のない項目は必須。環境変数ではDB_HOSTなどの大文字でも指定できる。
     db_host: str
     db_port: int = Field(gt=0, le=65535)
     db_name: str
     db_user: str
     db_password: str
+    db_charset: str = "utf8mb4"  # 絵文字なども扱えるMySQLの文字セット。
+    cors_origins: str  # 許可する画面の接続元をカンマ区切りで指定する。
 
-    # 文字コードが未指定の場合はutf8mb4を使用する。
-    db_charset: str = "utf8mb4"
-
-    # 接続を許可するフロントエンドのURLを受け取る。
-    cors_origins: str
-
-    # BaseSettingsが設定値を読み込む方法を指定する。
+    # 実行場所に左右されずfastapi_app/.envを読む。同じ項目は環境変数を優先する。
     model_config = SettingsConfigDict(
-        # このファイルから3階層上にある.envファイルを指定する。
-        # __file__：現在実行しているファイルのパスを表す。
-        # resolve()：絶対パスに変換する。
-        # parents[2]：3階層上の親ディレクトリを取得する。
-        env_file=str(Path(__file__).resolve().parents[2] / ".env"),
-        # .envファイルをUTF-8として読み込む。
+        env_file=Path(__file__).resolve().parents[2] / ".env",
         env_file_encoding="utf-8",
-        # Settingsクラスに定義していない環境変数は無視する。
-        extra="ignore",
+        extra="ignore",  # このクラスで定義していない設定項目は無視する。
     )
 
-    # メソッドを、引数を取らない属性のように呼び出せるようにする。
     @property
     def database_url(self) -> URL:
-
-        # .envから取得した値を使ってSQLAlchemy用のURLを作成する。
-        # URL.create()を使うと、パスワードに記号が含まれていても安全に処理できる。
+        """接続情報をまとめる。URL.createでパスワード内の記号もそのまま扱える。"""
         return URL.create(
-            # MySQLをPyMySQLドライバー経由で操作する。
             "mysql+pymysql",
             username=self.db_user,
             password=self.db_password,
             host=self.db_host,
             port=self.db_port,
             database=self.db_name,
-            # MySQLとの通信で使用する文字コードを指定する。
             query={"charset": self.db_charset},
         )
 
-    # CORSで許可するURLをリスト形式に変換する。
     @property
     def allowed_origins(self) -> list[str]:
-
-        # split(",")：カンマ区切りの文字列を分割する。
-        # strip()：URLの前後にある空白を削除する。
-        # if value.strip()：空文字列になった値を除外する。
+        """カンマで分割し、前後空白と空要素を除く。URLの妥当性までは検証しない。"""
         return [
             value.strip() for value in self.cors_origins.split(",") if value.strip()
         ]
 
 
-# 同じ設定オブジェクトを繰り返し作成しないように、結果をキャッシュする。
-# 引数がないため、Settingsは最初の呼び出し時に一度だけ作成される。
-@lru_cache
-def get_settings() -> Settings:
-    # 設定値は.envファイルまたは環境変数から読み込むため、ここでは引数を渡さない。
-    return Settings()  # type: ignore[call-arg]
-
-
-# .envから設定値を読み込み、Settingsオブジェクトを取得する。
-settings = get_settings()
-
-
-# データベースとの接続を管理するEngineを作成する。
-# 実際の接続は、基本的に最初のSQL実行時に行われる。
-engine = create_engine(
-    # Settingsで作成したMySQL接続URLを指定する。
-    settings.database_url,
-    # 接続を使う前に有効か確認し、切断済みなら再接続する。
-    pool_pre_ping=True,
-    # 接続を3600秒ごとに作り直し、古い接続が残るのを防ぐ。
-    pool_recycle=3600,
-    # 実行したSQLをコンソールへ表示しない。
-    echo=False,
-    # 例外ログにSQLのパラメーター値を含めない。
-    hide_parameters=True,
-)
-
-
-# データベース操作に使用するSessionを作成するための仕組みを定義する。
-# Sessionは、取得・追加・更新・削除からcommitまでの処理単位になる。
-SessionLocal = sessionmaker(
-    # 作成したSessionをEngineへ接続する。
-    bind=engine,
-    # SQL実行前に変更内容を自動反映しない。
-    autoflush=False,
-    # commit後も取得済みオブジェクトの値をそのまま使用できるようにする。
-    expire_on_commit=False,
-)
-
-
-# SQLAlchemyモデルが共通して継承する基底クラスを定義する。
-# Category、Assignee、Taskなどのモデルは、このBaseを継承して作成する。
 class Base(DeclarativeBase):
-    pass
+    """モデルの表・列の定義をBase.metadataへ集める。定義だけではDBに表を作らない。"""
 
 
-# 参考資料
-# https://qiita.com/masa-asa/items/7bea04e4f9ba5b9ef092
-# https://fastapi.tiangolo.com/ja/advanced/settings/
-# https://qiita.com/inetcpl/items/b4146b9e8e1adad239d8
+class Database:
+    """共有するEngineとSessionの生成方法を持つ。各処理のSession管理は共通関数が行う。"""
+
+    def __init__(self, engine: Engine) -> None:
+        self.engine = engine
+        # 同じ接続設定で、処理ごとに独立したSessionを作れるようにする。
+        self.session_factory = sessionmaker(
+            bind=engine,
+            autoflush=False,  # flushを明示する。commit時のflushは自動で行われる。
+            expire_on_commit=False,  # commit後も読み込み済みの値を保持する。
+        )
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "Database":
+        """設定からEngineとDatabaseを作る。実接続は通常、最初のDB操作時に行う。"""
+        return cls(
+            create_engine(
+                settings.database_url,
+                # 貸し出す際に接続を確認する。処理途中の切断までは防げない。
+                pool_pre_ping=True,
+                # 作成から1時間を超えた接続を、次の貸し出し時に作り直す。
+                pool_recycle=3600,
+                echo=False,  # SQLの簡易ログ出力を止める。
+                hide_parameters=True,  # SQLログなどでSQLへ渡した値を隠す。
+            )
+        )
+
+    def create_tables(self) -> None:
+        """読み込んだモデルの定義で、不足する表を作る。アプリ起動時には呼ばない。"""
+        # 既存の列の変更や、MySQLのDBそのものの作成は行わない。
+        Base.metadata.create_all(bind=self.engine)
+
+    def open_session(self) -> Session:
+        """新しいSessionを返す。SQL実行などで必要になった時点で接続を借りる。"""
+        # 処理間で使い回さず、利用後は共通関数のwithで閉じる。
+        return self.session_factory()
+
+    def dispose(self) -> None:
+        """アプリ終了時に、返却済みの接続を閉じる。"""
+        # 貸し出し中の接続は対象外なので、Sessionの終了処理も必要になる。
+        self.engine.dispose()
+
+
+def execute_database_operation(
+    database: Database,
+    operation: Callable[[Session], Result],
+    *,
+    write: bool = False,
+) -> Result:
+    """Sessionを用意 → 処理を実行 → 書き込みを確定 → Sessionを閉じる。
+
+    operationはSessionを受け取り、応答データの準備まで行う関数。
+    登録・更新・削除はwrite=True、取得だけなら省略する。
+    """
+    # commit中の通信断では結果が不明な場合があるため、自動再試行はしない。
+    # returnや例外でwithを抜けるときもSessionを閉じ、接続を返す。
+    with database.open_session() as db:
+        try:
+            result = operation(db)
+            # 取得だけならcommitは不要。書き込みは応答の検証後に確定する。
+            if write:
+                db.commit()
+            return result
+        except SQLAlchemyError as exc:
+            # DBの失敗は未確定の変更を取り消し、共通ハンドラーで500へ変換する。
+            db.rollback()
+            raise PersistenceError() from exc
+        except Exception:
+            # 存在確認や応答の検証に失敗した場合も、変更を取り消して原因を伝える。
+            db.rollback()
+            raise

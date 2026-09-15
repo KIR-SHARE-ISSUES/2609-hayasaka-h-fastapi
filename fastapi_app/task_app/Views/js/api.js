@@ -1,16 +1,9 @@
 /**
- * FastAPI との通信だけを担当するファイル。
- *
- * 画面の DOM 操作は app.js に置き、ここでは次の3点に集中します。
- * 1. URL / query parameter を組み立てる
- * 2. JSON を送受信する
- * 3. HTTP エラーを JavaScript の Error に変換する
+ * TaskApiはHTTP通信、ApiErrorは画面に渡す失敗情報を担当する。
+ * TaskAppから依頼を受け、ControllerのAPIへJSONを送り、応答や失敗を返す。
  */
-
-// 課題仕様の FastAPI 起動先。ポートを変えた場合はここだけ変更します。
 export const API_BASE_URL = "http://localhost:8888";
 
-/** API が返した status と detail を保持するエラー。 */
 export class ApiError extends Error {
   constructor(message, status, detail = null) {
     super(message);
@@ -20,150 +13,147 @@ export class ApiError extends Error {
   }
 }
 
-/**
- * FastAPI / Pydantic の detail を画面で読める1つの文へ変換する。
- * 422 の detail は配列、404 などの detail は文字列になることがあります。
- */
-function formatDetail(detail) {
-  if (typeof detail === "string") {
-    return detail;
+/** 接続先と通信手段を持つAPIクライアント。リトライによる二重登録を避ける。 */
+export class TaskApi {
+  constructor(baseUrl = API_BASE_URL, fetchImpl = (...args) => fetch(...args)) {
+    this.baseUrl = baseUrl.replace(/\/$/, "");
+    this.fetchImpl = fetchImpl;
   }
 
-  if (Array.isArray(detail)) {
-    return detail
-      .map((item) => {
-        const location = Array.isArray(item.loc) ? item.loc.slice(1).join(".") : "入力";
-        return `${location || "入力"}: ${item.msg ?? "値を確認してください"}`;
-      })
-      .join(" / ");
-  }
-
-  return "API リクエストに失敗しました。";
-}
-
-/**
- * すべての API 呼び出しが利用する共通関数。
- * DELETE /tasks/{id} の成功は 204 No Content なので、JSON 解析を行いません。
- */
-async function request(path, options = {}) {
-  const hasBody = options.body !== undefined;
-  const headers = {
-    Accept: "application/json",
-    ...(hasBody ? { "Content-Type": "application/json" } : {}),
-    ...options.headers,
-  };
-
-  let response;
-  try {
-    response = await fetch(`${API_BASE_URL}${path}`, {
-      ...options,
-      headers,
-    });
-  } catch (error) {
-    // サーバー停止、URL間違い、CORS ブロックなど、HTTP 応答前の失敗。
-    throw new ApiError(
-      `API に接続できません。FastAPI が ${API_BASE_URL} で起動しているか確認してください。`,
-      0,
-      error,
-    );
-  }
-
-  if (!response.ok) {
-    let detail = null;
-    const errorText = await response.text();
-    try {
-      const errorBody = JSON.parse(errorText);
-      detail = errorBody.detail ?? errorBody;
-    } catch {
-      detail = errorText || null;
+  /** 422の項目別エラーと、404/409などの文字列エラーを画面表示用に整える。 */
+  formatDetail(detail) {
+    if (typeof detail === "string") {
+      return detail;
     }
 
-    throw new ApiError(formatDetail(detail), response.status, detail);
+    if (Array.isArray(detail)) {
+      return detail
+        .map((item) => {
+          const location = Array.isArray(item.loc) ? item.loc.slice(1).join(".") : "入力";
+          return `${location || "入力"}: ${item.msg ?? "値を確認してください"}`;
+        })
+        .join(" / ");
+    }
+
+    return "API リクエストに失敗しました。";
   }
 
-  if (response.status === 204) {
-    return null;
+  /** JSON通信と失敗分類を集約する。HTTP失敗・通信断・不正な応答はApiErrorで呼び出し元へ返す。
+   * DELETE成功の204には本文がないため解析しない。書き込みは自動再試行しない。
+   */
+  async request(path, options = {}) {
+    const headers = {
+      Accept: "application/json",
+      ...(options.body !== undefined ? { "Content-Type": "application/json" } : {}),
+      ...options.headers,
+    };
+    let response;
+    try {
+      response = await this.fetchImpl(this.baseUrl + path, { ...options, headers });
+    } catch (error) {
+      throw new ApiError(
+        "API に接続できません。FastAPI が " + this.baseUrl + " で起動しているか確認してください。",
+        0,
+        error,
+      );
+    }
+
+    if (!response.ok) {
+      let detail;
+      try {
+        const text = await response.text();
+        try {
+          const body = JSON.parse(text);
+          detail = body.detail ?? body;
+        } catch {
+          detail = text || null;
+        }
+      } catch (error) {
+        throw new ApiError("API のエラー応答を読み取れませんでした。", response.status, error);
+      }
+      throw new ApiError(this.formatDetail(detail), response.status, detail);
+    }
+
+    if (response.status === 204) {
+      return null;
+    }
+    try {
+      return await response.json();
+    } catch (error) {
+      throw new ApiError(
+        "API から正しい JSON 応答を受け取れませんでした。",
+        response.status,
+        error,
+      );
+    }
   }
 
-  return response.json();
-}
+  /** 画面の状態名をAPIの真偽値へ変換して検索する。未指定の条件はURLに含めない。 */
+  getTasks({ status = "all", categoryId = null } = {}) {
+    const query = new URLSearchParams();
 
-/**
- * GET /tasks を呼ぶ。
- * status を API の is_done=true/false に変換し、category_id と組み合わせます。
- */
-export function getTasks({ status = "all", categoryId = null } = {}) {
-  const query = new URLSearchParams();
+    if (status === "open") {
+      query.set("is_done", "false");
+    } else if (status === "done") {
+      query.set("is_done", "true");
+    }
+    if (categoryId !== null && categoryId !== "") {
+      query.set("category_id", String(categoryId));
+    }
 
-  if (status === "open") {
-    query.set("is_done", "false");
-  } else if (status === "done") {
-    query.set("is_done", "true");
+    const suffix = query.size > 0 ? `?${query.toString()}` : "";
+    return this.request(`/tasks${suffix}`);
   }
 
-  // 0 や空文字を送らず、選択済みの数値 ID だけを query に追加します。
-  if (categoryId !== null && categoryId !== "") {
-    query.set("category_id", String(categoryId));
+  /** 編集前に1件を取得する。未存在の404は共通requestがApiErrorに変換する。 */
+  getTask(taskId) {
+    return this.request(`/tasks/${taskId}`);
   }
 
-  const suffix = query.size > 0 ? `?${query.toString()}` : "";
-  return request(`/tasks${suffix}`);
-}
+  /** 作成用の4項目を送る。成功したPromiseはサーバーの保存確定後の応答を持つ。 */
+  createTask(payload) {
+    return this.request("/tasks", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
 
-/** GET /tasks/{task_id}: 編集直前に最新の1件を取得する。 */
-export function getTask(taskId) {
-  return request(`/tasks/${taskId}`);
-}
+  /** 全5項目をPUTする。nullは関連解除を意味し、省略はAPIの422になる。 */
+  updateTask(taskId, payload) {
+    return this.request(`/tasks/${taskId}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+  }
 
-/**
- * POST /tasks: 新規タスクを作る。
- * payload は title / description / category_id / assignee_id の4項目です。
- */
-export function createTask(payload) {
-  return request("/tasks", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-}
+  /** DELETEの成功時はnullを返す。削除失敗を成功として扱わない。 */
+  deleteTask(taskId) {
+    return this.request(`/tasks/${taskId}`, { method: "DELETE" });
+  }
 
-/**
- * PUT /tasks/{task_id}: タスク全体を更新する。
- * payload は title / description / is_done / category_id / assignee_id の5項目です。
- */
-export function updateTask(taskId, payload) {
-  return request(`/tasks/${taskId}`, {
-    method: "PUT",
-    body: JSON.stringify(payload),
-  });
-}
+  /** カテゴリの選択肢を取得する。画面への反映はTaskAppが担当する。 */
+  getCategories() {
+    return this.request("/categories");
+  }
 
-/** DELETE /tasks/{task_id}: 成功時は 204 で本文なし。 */
-export function deleteTask(taskId) {
-  return request(`/tasks/${taskId}`, { method: "DELETE" });
-}
+  /** カテゴリ名を送る。名前重複の409もほかのHTTPエラーと同じ経路で伝える。 */
+  createCategory(payload) {
+    return this.request("/categories", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
 
-/** GET /categories: 新規・編集・絞り込みの選択肢に使う。 */
-export function getCategories() {
-  return request("/categories");
-}
+  /** 担当者の選択肢を取得する。画面への反映はTaskAppが担当する。 */
+  getAssignees() {
+    return this.request("/assignees");
+  }
 
-/** POST /categories: カテゴリ専用モーダルから {name} を送る。 */
-export function createCategory(payload) {
-  return request("/categories", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-}
-
-/** GET /assignees: 新規・編集の選択肢に使う。 */
-export function getAssignees() {
-  return request("/assignees");
-}
-
-/** POST /assignees: 担当者専用モーダルから {name} を送る。 */
-export function createAssignee(payload) {
-  return request("/assignees", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
+  /** 担当者名を送る。名前重複の409もほかのHTTPエラーと同じ経路で伝える。 */
+  createAssignee(payload) {
+    return this.request("/assignees", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
 }

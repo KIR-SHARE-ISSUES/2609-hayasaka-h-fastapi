@@ -1,60 +1,52 @@
-# フロントエンドの読み方
+# 画面とAPIの流れ
 
-このフロントエンドは、React / Vue を使わない HTML + CSS + JavaScript の SPA です。
+HTML・CSS・JavaScriptで動くタスク管理画面。実行時のビルドは不要。
 
-## ファイルの役割
+## 処理の担当
 
-- `index.html`: 入力欄、一覧、編集・カテゴリ・担当者の3モーダル
-- `css/style.css`: レイアウト、完了表示、モーダル、スマートフォン対応
-- `js/api.js`: `fetch` と FastAPI の9エンドポイント
-- `js/app.js`: 画面状態、イベント、DOM の再描画
+| 担当 | 役割 |
+|---|---|
+| TaskApp | 入力欄・一覧・通知を管理する |
+| TaskApi | HTTPでJSONを送受信し、通信失敗を画面へ伝える |
+| Controller | 入力を受け、対象・関連先を確認し、処理の順序と応答を決める |
+| DAL / Repository | SQLを組み立て、DBの検索・変更を行う |
+| execute_database_operation | Sessionの準備・実行・確定・取り消し・終了をまとめて管理する |
 
-HTML、CSS、JavaScript には、セクションや API との境界が分かる日本語コメントを入れています。
+登録の流れは「入力 → APIへ送信 → Controllerで関連確認 → DALで追加・再取得
+→ 応答データの検証 → 保存確定 → 画面の一覧更新」。
+API用スキーマは入力の型・文字数を、ORMモデルはDBの列・関連を定義する。
 
-## API 対応
+## 画面処理の意図
 
-| 操作 | JavaScript | FastAPI |
-|---|---|---|
-| 初期表示 | `getTasks()` | `GET /tasks` |
-| タスク追加 | `createTask()` | `POST /tasks` |
-| 編集前の取得 | `getTask()` | `GET /tasks/{id}` |
-| 完了切替・編集保存 | `updateTask()` | `PUT /tasks/{id}` |
-| 削除 | `deleteTask()` | `DELETE /tasks/{id}` |
-| カテゴリ選択肢 | `getCategories()` | `GET /categories` |
-| カテゴリ追加 | `createCategory()` | `POST /categories` |
-| 担当者選択肢 | `getAssignees()` | `GET /assignees` |
-| 担当者追加 | `createAssignee()` | `POST /assignees` |
+- イベントはinitializeで一度だけ登録し、bindやアロー関数でthisを固定する。
+- 保存失敗時は入力を残す。保存後の一覧取得だけが失敗したら、保存済みと表示する。
+- 古い通信結果で新しい一覧や編集内容を上書きしないよう、要求の番号を確認する。
+- 選択欄のIDは数値へ、未設定はnullへ変換する。PUTは全5項目を送る。
+- DELETEの204には本文がないため、JSONとして解析しない。
+- APIから受け取った文字列はテキストとして表示する。
 
-絞り込みもブラウザ内だけで行わず、`GET /tasks?is_done=...&category_id=...` を呼びます。
+別タブとの同時編集を検出する仕組みはないため、古い一覧からの全項目更新で上書きする可能性がある。
 
-## 起動
+## 起動と確認
 
-FastAPI を `http://localhost:8888` で起動してから、このフォルダで次を実行します。
-
-WSL / macOS:
+既存のDB・テーブルを用意し、FastAPIをhttp://localhost:8888で起動する。
+アプリ起動時のテーブル作成は行わない。このフォルダーで次を実行して画面を開く。
 
 ```bash
-python3 -m http.server 3000
+python3 -m http.server 3000 --bind 127.0.0.1
 ```
 
-Windows PowerShell:
+[画面を開く](http://localhost:3000)。Windowsではpython3をpyに置き換える。
+API_BASE_URL、APIの起動ポート、CORS_ORIGINSを対応させる。
 
-```powershell
-py -m http.server 3000
+確認する操作：タスク登録・編集・関連解除・完了切替・削除、カテゴリ・担当者登録、
+空白タイトルの拒否、名前重複時の通知。保存に失敗した場合は入力が残ることも確認する。
+
+書式を確認する場合はNode.jsとnpmを使い、このフォルダーで実行する。
+
+```bash
+npm ci
+npm run format:check
 ```
 
-<http://localhost:3000> を開いてください。API のポートを変える場合は `js/api.js` の `API_BASE_URL` を変更します。
-
-## 実装上の重要点
-
-- HTML の `select.value` は文字列なので、ID を `Number` に変換する。
-- 未設定は空文字でなく JSON の `null` を送る。
-- GET レスポンスの `category` / `assignee` はオブジェクトだが、POST / PUT は ID を送る。
-- 完了チェックも PUT なので、`is_done` だけでなくタスクの5項目を送る。
-- 204 の DELETE 応答は本文がないため、`response.json()` を呼ばない。
-- API の文字列は `innerHTML` でなく `textContent` で表示する。
-- カテゴリ追加後は新規用・編集用・絞り込み用の3選択欄を更新する。
-- 担当者追加後は新規用・編集用の2選択欄を更新する。
-- 再読み込みではタスクとカテゴリ・担当者の選択肢を再取得する。
-- 登録・編集ダイアログでの API エラーは、開いているダイアログ内に表示する。
-- 保存後の一覧取得に失敗した場合は、保存済みであることと再取得の失敗を表示する。
+書式をそろえるときはnpm run formatを実行する。

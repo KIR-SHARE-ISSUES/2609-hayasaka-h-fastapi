@@ -1,220 +1,157 @@
-"""タスクに関するAPIのエンドポイントを定義する場所。
+"""タスクAPIの受付から、存在確認・DB操作・応答作成までの流れをまとめる。
 
-- GET /tasks：タスクを一覧取得する。
-- GET /tasks/{task_id}：タスクを1件取得する。
-- POST /tasks：タスクを新規作成する。
-- PUT /tasks/{task_id}：タスクを更新する。
-- DELETE /tasks/{task_id}：タスクを削除する。
+入力検証 → Controllerで存在確認 → DALでDB操作 → HTTP応答。
+Sessionの準備・保存確定・取り消し・終了は、database.pyの共通関数に任せる。
+同期DBを使うためルートはdefとし、FastAPIのスレッドプールで実行する。
 """
 
-# APIルーター、HTTPエラー、レスポンス、ステータスコードを読み込む。
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, Query, Response, status
+from fastapi import APIRouter, Path, Query, Response, status
+from sqlalchemy.orm import Session
 
-# Taskに関するデータベース操作をデータアクセス層から読み込む。
-from ..DataAccessLayer.tasks import (
-    delete_task_data,
-    find_task,
-    find_tasks,
-    save_task,
-    update_task_data,
-)
-
-# FastAPIの依存性注入でデータベースSessionを受け取るための型を読み込む。
-from ..dependencies import DbSession
-
-# データベースのテーブルに対応するモデルを読み込む。
-from ..Model.models import Assignee, Category, Task
-
-# リクエストとレスポンスのデータ形式を読み込む。
+from ..DataAccessLayer.database import Database, execute_database_operation
+from ..DataAccessLayer.names import AssigneeRepository, CategoryRepository
+from ..DataAccessLayer.tasks import TaskRepository
+from ..Model.errors import NotFoundError
+from ..Model.models import Task
 from ..Model.schemas import TaskCreate, TaskResponse, TaskUpdate
 
-# タスクAPI専用のルーターを作成する。
-router = APIRouter(
-    # このルーターに定義したURLの先頭へ/tasksを付ける。
-    prefix="/tasks",
-    # Swagger UIでtasksグループとして表示する。
-    tags=["tasks"],
-)
+# URL内のIDは正の整数に限定する。DBに存在するかは各処理で確認する。
+TaskId = Annotated[int, Path(gt=0)]
 
 
-# GET /tasksを定義する。
-@router.get(
-    "",
-    # TaskResponse形式のリストをレスポンスとして返す。
-    response_model=list[TaskResponse],
-)
-def list_tasks(
-    # リクエストごとのデータベースSessionを受け取る。
-    db: DbSession,
-    # 完了状態による絞り込み条件を受け取る。
-    # 「bool | None」は、True・False・未指定のいずれかを表す。
-    is_done: bool | None = None,
-    # カテゴリーIDによる絞り込み条件を受け取る。
-    category_id: Annotated[int | None, Query(gt=0)] = None,
-):
-    # データアクセス層へタスクの一覧取得を依頼する。
-    return find_tasks(
-        db,
-        is_done=is_done,
-        category_id=category_id,
-    )
+class TaskController:
+    """タスクの処理手順を管理する。SQLはDAL、例外のHTTP変換はApiErrorHandlersへ任せる。
 
+    アプリで共有するDatabaseを保持し、Sessionは処理ごとに共通関数で作る。
+    """
 
-# GET /tasks/{task_id}を定義する。
-# {task_id}の部分には、取得したいタスクのIDが入る。
-@router.get(
-    "/{task_id}",
-    response_model=TaskResponse,
-)
-def get_task(
-    task_id: Annotated[int, Path(gt=0)],
-    db: DbSession,
-):
-    # IDを使って、関連データを含むタスクを検索する。
-    task = find_task(db, task_id)
+    def __init__(self, database: Database) -> None:
+        self.database = database
+        # prefixは共通URL、tagsはAPIドキュメント上の分類。
+        self.router = APIRouter(prefix="/tasks", tags=["tasks"])
 
-    # 該当するタスクが存在しない場合は404エラーを返す。
-    if task is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Task not found",
+        # URLと処理を登録する。リクエストが来たときにFastAPIがメソッドを呼ぶ。
+        self.router.add_api_route(
+            "",
+            self.list_all,
+            name="list_tasks",
+            methods=["GET"],
+            response_model=list[TaskResponse],
+        )
+        self.router.add_api_route(
+            "",
+            self.create,
+            name="create_task",
+            methods=["POST"],
+            response_model=TaskResponse,
+            status_code=status.HTTP_201_CREATED,
+        )
+        self.router.add_api_route(
+            "/{task_id}",
+            self.get,
+            name="get_task",
+            methods=["GET"],
+            response_model=TaskResponse,
+        )
+        self.router.add_api_route(
+            "/{task_id}",
+            self.update,
+            name="update_task",
+            methods=["PUT"],
+            response_model=TaskResponse,
+        )
+        self.router.add_api_route(
+            "/{task_id}",
+            self.delete,
+            name="delete_task",
+            methods=["DELETE"],
+            status_code=status.HTTP_204_NO_CONTENT,
+            response_class=Response,
         )
 
-    # 見つかったタスクを返す。
-    return task
+    def list_all(
+        self,
+        is_done: bool | None = None,
+        category_id: Annotated[int | None, Query(gt=0)] = None,
+    ) -> list[TaskResponse]:
+        """GET /tasks：検索結果を応答へ変換してから、共通関数がSessionを閉じる。"""
 
+        def operation(db: Session) -> list[TaskResponse]:
+            # Noneは絞り込みなし、Falseは未完了。関連情報もSessionの終了前に読む。
+            tasks = TaskRepository(db).list_all(
+                is_done=is_done, category_id=category_id
+            )
+            return [TaskResponse.model_validate(task) for task in tasks]
 
-# 指定されたCategoryやAssigneeが存在するか確認する共通関数。
-def require_reference(
-    db,
-    model,
-    value,
-    label,
-):
-    # valueがNoneでない場合だけ、IDに対応するデータを検索する。
-    # andには、左側がTrueのときだけ右側を評価する短絡評価がある。
-    if value is not None and db.get(model, value) is None:
-        # 関連データが存在しない場合は404エラーを返す。
-        # f文字列を使い、CategoryまたはAssigneeをメッセージへ埋め込む。
-        raise HTTPException(
-            status_code=404,
-            detail=f"{label} not found",
-        )
+        return execute_database_operation(self.database, operation)
 
+    def get(self, task_id: TaskId) -> TaskResponse:
+        """GET /tasks/{task_id}：対象を確認し、Sessionが開いている間に応答を作る。"""
 
-# POST /tasksを定義する。
-@router.post(
-    "",
-    # 作成したタスクをTaskResponse形式で返す。
-    response_model=TaskResponse,
-    # 作成成功時のHTTPステータスコードを201にする。
-    status_code=status.HTTP_201_CREATED,
-)
-def create_task(
-    # リクエスト本文をTaskCreateで検証して受け取る。
-    payload: TaskCreate,
-    db: DbSession,
-):
-    # 指定されたカテゴリーが存在するか確認する。
-    require_reference(
-        db,
-        Category,
-        payload.category_id,
-        "Category",
-    )
+        def operation(db: Session) -> TaskResponse:
+            repository = TaskRepository(db)
+            return TaskResponse.model_validate(self._require_task(repository, task_id))
 
-    # 担当者IDが指定されている場合は、その担当者が存在するか確認する。
-    require_reference(
-        db,
-        Assignee,
-        payload.assignee_id,
-        "Assignee",
-    )
+        return execute_database_operation(self.database, operation)
 
-    # model_dump()でPydanticモデルを辞書へ変換する。
-    # データアクセス層へタスクの保存を依頼する。
-    return save_task(
-        db,
-        payload.model_dump(),
-    )
+    def create(self, payload: TaskCreate) -> TaskResponse:
+        """POST /tasks：関連確認 → 作成 → 応答の準備 → 保存確定の順で進める。"""
 
+        def operation(db: Session) -> TaskResponse:
+            repository = TaskRepository(db)
+            self._require_references(db, payload.category_id, payload.assignee_id)
+            # 入力を辞書にし、**でDALの名前付き引数へ展開する。
+            task = repository.create(**payload.model_dump())
+            # ID・日時・関連を取得し、応答の検証もcommit前に済ませる。
+            return TaskResponse.model_validate(repository.refresh(task))
 
-# PUT /tasks/{task_id}を定義する。
-@router.put(
-    "/{task_id}",
-    response_model=TaskResponse,
-)
-def update_task(
-    # 更新するタスクのIDをURLから受け取る。
-    task_id: Annotated[int, Path(gt=0)],
-    # 更新内容をTaskUpdateで検証して受け取る。
-    payload: TaskUpdate,
-    # リクエストごとのデータベースSessionを受け取る。
-    db: DbSession,
-):
-    # 主キーであるtask_idを使ってタスクを取得する。
-    # db.get()は、モデルと主キーを指定して1件取得するメソッドである。
-    task = db.get(Task, task_id)
+        return execute_database_operation(self.database, operation, write=True)
 
-    # 更新対象のタスクが存在しない場合は404エラーを返す。
-    if task is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Task not found",
-        )
+    def update(
+        self,
+        task_id: TaskId,
+        payload: TaskUpdate,
+    ) -> TaskResponse:
+        """PUT /tasks/{task_id}：対象・関連を確認し、全5項目を更新して保存する。"""
 
-    # 更新後に設定するカテゴリーが存在するか確認する。
-    require_reference(
-        db,
-        Category,
-        payload.category_id,
-        "Category",
-    )
+        def operation(db: Session) -> TaskResponse:
+            repository = TaskRepository(db)
+            task = self._require_task(repository, task_id)
+            self._require_references(db, payload.category_id, payload.assignee_id)
+            # 必須項目はTaskUpdateで検証済み。nullは関連・説明を未設定に戻す指定。
+            repository.update(task, **payload.model_dump())
+            return TaskResponse.model_validate(repository.refresh(task))
 
-    # 更新後に設定する担当者が存在するか確認する。
-    require_reference(
-        db,
-        Assignee,
-        payload.assignee_id,
-        "Assignee",
-    )
+        return execute_database_operation(self.database, operation, write=True)
 
-    # 更新内容を辞書へ変換し、データアクセス層へ渡す。
-    return update_task_data(
-        db,
-        task,
-        payload.model_dump(),
-    )
+    def delete(self, task_id: TaskId) -> Response:
+        """DELETE /tasks/{task_id}：削除を確定してSessionを閉じ、本文なしの204を返す。"""
 
+        def operation(db: Session) -> None:
+            repository = TaskRepository(db)
+            repository.delete(self._require_task(repository, task_id))
 
-# DELETE /tasks/{task_id}を定義する。
-@router.delete(
-    "/{task_id}",
-    # 削除成功時のHTTPステータスコードを204にする。
-    status_code=status.HTTP_204_NO_CONTENT,
-    # JSONではなく、本文を持たない通常のResponseを使用する。
-    response_class=Response,
-)
-def delete_task(
-    task_id: Annotated[int, Path(gt=0)],
-    db: DbSession,
-) -> Response:
-    # 主キーであるtask_idを使って削除対象を取得する。
-    task = db.get(Task, task_id)
+        # 削除が失敗した場合は例外が伝わり、成功応答には進まない。
+        execute_database_operation(self.database, operation, write=True)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    # 削除対象が存在しない場合は404エラーを返す。
-    if task is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Task not found",
-        )
+    def _require_task(self, repository: TaskRepository, task_id: int) -> Task:
+        """取得・更新・削除で共通の存在確認。未存在は共通ハンドラーが404に変換する。"""
+        task = repository.get(task_id)
+        if task is None:
+            raise NotFoundError("Task")
+        return task
 
-    # データアクセス層へタスクの削除を依頼する。
-    delete_task_data(db, task)
-
-    # 204はレスポンス本文がないことを表す。
-    return Response(
-        status_code=status.HTTP_204_NO_CONTENT,
-    )
+    def _require_references(
+        self,
+        db: Session,
+        category_id: int | None,
+        assignee_id: int | None,
+    ) -> None:
+        """指定された関連先だけを確認する。正のIDでも、実在しなければ保存しない。"""
+        if category_id is not None and CategoryRepository(db).get(category_id) is None:
+            raise NotFoundError("Category")
+        if assignee_id is not None and AssigneeRepository(db).get(assignee_id) is None:
+            raise NotFoundError("Assignee")

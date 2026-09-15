@@ -1,140 +1,103 @@
-"""APIのリクエスト・レスポンスを表すPydanticスキーマ。
+"""APIで受け取る項目・返す項目を定義する。入力の型・文字数・省略・nullを検証する。
 
-- FastAPIが受け取るデータと返すデータの形式を定義する。
-- 入力値の型、文字数、IDの範囲を検証する。
-- 空白だけのnameとtitleを拒否する。
-- SQLAlchemyのモデルからレスポンス用のデータを読み取る。
+既存APIとの互換性のためPydanticの型変換と余分な入力項目の無視を維持する。
+型・文字数はここで、IDの実在はControllerで確認する。
 """
 
-# 作成日時と更新日時を表す型を読み込む。
 from datetime import datetime
+from typing import Annotated, Any
 
-# 基本の型に、検証ルールなどの追加情報を付けるために使用する。
-from typing import Annotated
-
-# BaseModel：データの型や値を検証するスキーマの基底クラス。
-# ConfigDict：スキーマの動作を設定する。
-# Field：文字数や数値の範囲などの制約を指定する。
-# field_validator：特定の項目に独自の検証・変換処理を追加する。
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-# 複数のスキーマで使う検証ルールを共通化する。
-Name = Annotated[str, Field(min_length=1, max_length=100)]  # 名前は1～100文字。
-Title = Annotated[str, Field(min_length=1, max_length=255)]  # タイトルは1～255文字。
-PositiveId = Annotated[int, Field(gt=0)]  # gtは「より大きい」を表し、0以下を拒否する。
+Name = Annotated[str, Field(min_length=1, max_length=100)]
+Title = Annotated[str, Field(min_length=1, max_length=255)]
+PositiveId = Annotated[int, Field(gt=0)]
 Description = Annotated[str, Field(max_length=2000)]
 
-# PositiveIdは数値の範囲を検証するだけで、DB上にそのIDが存在するかは確認しない。
+
+class InputModel(BaseModel):
+    """既存クライアントが送る未定義項目は保存対象に含めず無視する。"""
+
+    model_config = ConfigDict(extra="ignore")
 
 
-# カテゴリー作成時の入力項目を定義する。
-class CategoryCreate(BaseModel):
-    name: Name  # 既定値がないため、nameの指定は必須である。
+class OrmResponse(BaseModel):
+    """ORM属性から応答を組み立てる。書き込みではcommit前に検証を完了する。"""
 
-    # 文字数を検証する前に前後の空白を除き、空白だけの入力を拒否できるようにする。
-    @field_validator(
-        "name", mode="before"
-    )  # Pydanticの通常の型・制約検証より先に実行する。
-    @classmethod  # インスタンスではなくクラスを、第1引数clsとして受け取る。
-    def strip_name(cls, value):
-        # isinstance()で文字列か確認し、それ以外は通常の型検証へ渡す。
-        # 「A if 条件 else B」は、条件がTrueならA、FalseならBを返す式である。
-        return (
-            value.strip() if isinstance(value, str) else value
-        )  # strip()は前後の空白を除く。
-
-        # 例："  仕事  "は"仕事"になる。文字列の途中の空白は残る。
-        # "   "は""になり、その後のmin_length=1の検証で拒否される。
-
-
-# カテゴリーを返すときの出力項目を定義する。
-class CategoryResponse(BaseModel):
-    # 辞書だけでなく、category.idやcategory.nameなどの属性から値を読み取る。
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
-    name: str
 
+class NameCreate(InputModel):
+    """カテゴリ・担当者に共通の名前入力。前後空白を除いてから長さを検証する。"""
 
-# 担当者作成時の入力項目を定義する。
-class AssigneeCreate(BaseModel):
     name: Name
 
-    # 名前の前後の空白を除いてから、型と文字数を検証する。
     @field_validator("name", mode="before")
     @classmethod
-    def strip_name(cls, value):
-        return (
-            value.strip() if isinstance(value, str) else value
-        )  # 文字列の場合だけ整形する。
-
-
-# 担当者を返すときの出力項目を定義する。
-class AssigneeResponse(BaseModel):
-    # Assigneeモデルの属性からidとnameを読み取れるようにする。
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    name: str
-
-
-# タスクの作成・更新で共通する入力項目と検証処理をまとめる。
-class TaskBase(BaseModel):
-    title: Title  # 必須項目とし、1～255文字に制限する。
-
-    # タイトルの前後の空白を除き、空白だけなら文字数の検証で拒否する。
-    @field_validator("title", mode="before")
-    @classmethod
-    def strip_title(cls, value):
+    def strip_name(cls, value: Any) -> Any:
+        """空白だけの名前を空文字にし、min_lengthで拒否できるようにする。"""
         return value.strip() if isinstance(value, str) else value
 
 
-# タスク作成時の入力項目を定義する。
-# TaskBaseを継承し、titleとその検証処理を引き継ぐ。
-class TaskCreate(TaskBase):
-    # 「| None」はNoneを許可し、「= None」は省略時の値を指定する。
-    description: Description | None = None
+class CategoryCreate(NameCreate):
+    """カテゴリ作成の入力。重複判定はDBの一意制約に従う。"""
 
-    # カテゴリーと担当者は未設定を許可する。
-    # 指定する場合は、0より大きい整数である必要がある。
+
+class AssigneeCreate(NameCreate):
+    """担当者作成の入力。重複判定はDBの一意制約に従う。"""
+
+
+class CategoryResponse(OrmResponse):
+    """カテゴリのIDと名前だけを外部へ返す。"""
+
+    id: int
+    name: str
+
+
+class AssigneeResponse(OrmResponse):
+    """担当者のIDと名前だけを外部へ返す。"""
+
+    id: int
+    name: str
+
+
+class TaskBase(InputModel):
+    """作成・更新で共有するタイトルの契約。空白だけの入力は拒否する。"""
+
+    title: Title
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def strip_title(cls, value: Any) -> Any:
+        """文字列だけ整形し、それ以外の値の可否はPydanticの検証に任せる。"""
+        return value.strip() if isinstance(value, str) else value
+
+
+class TaskCreate(TaskBase):
+    """POSTでは省略した説明・関連を未設定にする。作成時の完了状態は未完了固定。"""
+
+    description: Description | None = None
     category_id: PositiveId | None = None
     assignee_id: PositiveId | None = None
 
 
-# タスク更新時の入力項目を定義する。
-# TaskBaseから継承したtitleと、ここで定義するis_doneを必須にする。
 class TaskUpdate(TaskBase):
-    is_done: bool  # 完了状態を受け取る。既定値がないため省略できない。
+    """PUTは全5項目必須。解除はnullを送り、省略による意図しない解除を防ぐ。"""
 
-    # PUTは全項目の置き換え。関連や説明を解除するときも明示的にnullを送る。
-    # 省略を拒否し、値の送り忘れによる意図しない関連解除を防ぐ。
+    is_done: bool
     description: Description | None
     category_id: PositiveId | None
     assignee_id: PositiveId | None
 
 
-# タスクを返すときの出力項目を定義する。
-# 作成・更新用とは分け、ID、関連データ、日時も返せるようにする。
-class TaskResponse(BaseModel):
-    # Taskモデルの属性から、各項目の値を読み取れるようにする。
-    model_config = ConfigDict(from_attributes=True)
+class TaskResponse(OrmResponse):
+    """関連名と日時を含む応答。作成後はORMの遅延読み込みを必要としない。"""
 
-    # タスクの基本情報を返す。
     id: int
     title: str
-
-    # Noneを許可するが、既定値がないため検証時には項目自体が必要である。
-    # JSONとして返す際、Noneはnullになる。
     description: str | None
-
     is_done: bool
-
-    # IDだけでなく、idとnameを含む関連データを入れ子にして返す。
-    # 例："category": {"id": 1, "name": "仕事"}
-    # 関連付けがない場合はnullを返す。
     category: CategoryResponse | None
     assignee: AssigneeResponse | None
-
-    # 作成日時と更新日時を返す。このスキーマ自体は日時を生成しない。
     created_at: datetime
     updated_at: datetime

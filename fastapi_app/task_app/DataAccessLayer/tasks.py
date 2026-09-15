@@ -1,148 +1,103 @@
-"""Taskに関するデータベース操作を担当するデータアクセス層。
+"""タスクのSQL・ORM操作をまとめる。存在確認と処理順序はControllerが担当する。
 
-- 条件に合うタスクの一覧取得
-- IDを指定したタスクの取得
-- タスクの新規作成
-- タスクの更新
-- タスクの削除
+Controllerから共通関数を呼び、その中でRepositoryの検索・変更を実行する。
+ORMは、DBの行をPythonのオブジェクトとして扱う仕組み。
 """
 
-# SELECT文を作成するための関数を読み込む。
 from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
 
-# SQLAlchemyで発生するデータベース関連の例外を読み込む。
-from sqlalchemy.exc import SQLAlchemyError
-
-# 関連データを追加のSELECT文でまとめて読み込む機能を読み込む。
-from sqlalchemy.orm import selectinload
-
-# tasksテーブルに対応するTaskモデルを読み込む。
+from ..Model.errors import NotFoundError
 from ..Model.models import Task
 
-# Taskと一緒にCategoryとAssigneeも取得する共通のSELECT文を作成する。
-# selectinload()を使うことで、タスクごとにSQLが繰り返されるN+1問題を防ぐ。
-TASK_WITH_RELATIONS = select(Task).options(
-    selectinload(Task.category),
-    selectinload(Task.assignee),
-)
 
+class TaskRepository:
+    """受け取ったSessionでDBを操作する。保存確定・取り消し・終了はDBの共通関数へ任せる。"""
 
-# 条件に合うタスクを一覧取得する。
-def find_tasks(
-    db,
-    # *以降の引数は、名前を指定して渡す必要がある。
-    *,
-    is_done=None,
-    category_id=None,
-):
-    # 関連データを含む共通のSELECT文を使用する。
-    statement = TASK_WITH_RELATIONS
+    def __init__(self, db: Session) -> None:
+        self.db = db
 
-    # is_doneが指定されている場合だけ、完了状態で絞り込む。
-    # 「is not None」により、Falseが指定された場合も正しく処理できる。
-    if is_done is not None:
-        statement = statement.where(Task.is_done == is_done)
+    def list_all(
+        self,
+        *,
+        is_done: bool | None = None,
+        category_id: int | None = None,
+    ) -> list[Task]:
+        """条件と並び順を組み立てて一覧を取得する。該当なしなら空リストを返す。"""
+        # 関連名もまとめて取得し、タスクごとに問い合わせる回数を抑える。
+        statement = select(Task).options(
+            selectinload(Task.category),
+            selectinload(Task.assignee),
+        )
+        # Falseも「未完了」という有効な条件なので、Noneだけを未指定として扱う。
+        if is_done is not None:
+            statement = statement.where(Task.is_done == is_done)
+        if category_id is not None:
+            statement = statement.where(Task.category_id == category_id)
 
-    # category_idが指定されている場合だけ、カテゴリーで絞り込む。
-    if category_id is not None:
-        statement = statement.where(Task.category_id == category_id)
+        # 作成日時の新しい順。同じ日時ならIDで順序をそろえる。
+        statement = statement.order_by(Task.created_at.desc(), Task.id.desc())
+        return list(self.db.scalars(statement).all())
 
-    # 作成日時が新しい順に並べる。
-    # 作成日時が同じ場合は、IDが大きいタスクを先に並べる。
-    statement = statement.order_by(
-        Task.created_at.desc(),
-        Task.id.desc(),
-    )
+    def get(self, task_id: int) -> Task | None:
+        """タスクと関連を1件取得する。未存在を404にする判断はControllerへ任せる。"""
+        statement = (
+            select(Task)
+            .where(Task.id == task_id)
+            .options(selectinload(Task.category), selectinload(Task.assignee))
+            # 取得済みのオブジェクトも読み直す。変更後は先にflushしてから呼ぶ。
+            .execution_options(populate_existing=True)
+        )
+        return self.db.scalar(statement)
 
-    # scalars()でTaskオブジェクトだけを取り出す。
-    # all()で条件に合うすべてのタスクを取得する。
-    return db.scalars(statement).all()
+    def create(
+        self,
+        *,
+        title: str,
+        description: str | None,
+        category_id: int | None,
+        assignee_id: int | None,
+    ) -> Task:
+        """未完了のタスクをSessionへ追加する。INSERTは次のflushで実行する。"""
+        task = Task(
+            title=title,
+            description=description,
+            is_done=False,
+            category_id=category_id,
+            assignee_id=assignee_id,
+        )
+        self.db.add(task)
+        return task
 
+    def update(
+        self,
+        task: Task,
+        *,
+        title: str,
+        description: str | None,
+        is_done: bool,
+        category_id: int | None,
+        assignee_id: int | None,
+    ) -> Task:
+        """更新対象の5項目を明示し、IDや作成日時を上書きしない。"""
+        # Sessionが変更を追跡するため、再度addする必要はない。
+        # 同時編集を検出する仕組みはなく、後の更新で上書きされ得る。
+        task.title = title
+        task.description = description
+        task.is_done = is_done
+        task.category_id = category_id
+        task.assignee_id = assignee_id
+        return task
 
-# IDを指定してタスクを1件取得する。
-def find_task(db, task_id: int):
-    # Task.idがtask_idと一致する、という検索条件を追加する。
-    statement = TASK_WITH_RELATIONS.where(Task.id == task_id).execution_options(
-        # 外部キー更新後も、Sessionに残る変更前の関連を返さずDBから読み直す。
-        populate_existing=True,
-    )
+    def refresh(self, task: Task) -> Task:
+        """変更をSQLで反映し、応答に必要なID・日時・関連を取得する独自メソッド。"""
+        # flushはSession内の変更全体をDBへ送る。保存確定は後のcommitで行う。
+        self.db.flush()
+        refreshed = self.get(task.id)
+        if refreshed is None:
+            raise NotFoundError("Task")
+        return refreshed
 
-    # scalar()で最初のTaskオブジェクトを取得する。
-    # 該当するタスクが存在しない場合はNoneを返す。
-    return db.scalar(statement)
-
-
-# 新しいタスクをデータベースへ保存する。
-def save_task(db, values: dict):
-    # **valuesで辞書の各要素をキーワード引数としてTaskへ渡す。
-    # 例：{"title": "勉強"} → Task(title="勉強")
-    # 新しいタスクの完了状態は必ずFalseにする。
-    task = Task(
-        **values,
-        is_done=False,
-    )
-
-    # 新しいTaskをデータベースへの登録対象に追加する。
-    db.add(task)
-
-    try:
-        # INSERTを実行し、変更内容をデータベースへ確定する。
-        db.commit()
-
-    # データベース処理に失敗した場合の処理。
-    except SQLAlchemyError:
-        # 失敗した変更を取り消し、Sessionを再利用できる状態に戻す。
-        db.rollback()
-
-        # 発生した例外を呼び出し元へそのまま渡す。
-        raise
-
-    # 保存したタスクを関連データ付きで取得して返す。
-    return find_task(db, task.id)
-
-
-# 既存タスクのデータを更新する。
-def update_task_data(
-    db,
-    task: Task,
-    values: dict,
-):
-    # 更新するフィールド名と値を1組ずつ取り出す。
-    for field, value in values.items():
-
-        # setattr()で、フィールド名を文字列で指定して値を変更する。
-        # 例：setattr(task, "title", "買い物")はtask.title = "買い物"と同じ。
-        setattr(task, field, value)
-
-    try:
-        # Taskの変更内容をUPDATE文でデータベースへ反映する。
-        db.commit()
-
-    # データベース処理に失敗した場合の処理。
-    except SQLAlchemyError:
-        # 更新前の状態へ戻し、Sessionを再利用できる状態にする。
-        db.rollback()
-
-        # 発生した例外を呼び出し元へそのまま渡す。
-        raise
-
-    # 更新後のタスクを関連データ付きで取得して返す。
-    return find_task(db, task.id)
-
-
-# 指定されたタスクをデータベースから削除する。
-def delete_task_data(db, task: Task):
-    # Taskをデータベースから削除する対象として登録する。
-    db.delete(task)
-
-    try:
-        # DELETEを実行し、削除をデータベースへ確定する。
-        db.commit()
-
-    # データベース処理に失敗した場合の処理。
-    except SQLAlchemyError:
-        # 削除処理を取り消し、Sessionを再利用できる状態にする。
-        db.rollback()
-
-        # 発生した例外を呼び出し元へそのまま渡す。
-        raise
+    def delete(self, task: Task) -> None:
+        """削除対象へ登録する。DELETEの実行・確定は共通関数のcommitで行う。"""
+        self.db.delete(task)

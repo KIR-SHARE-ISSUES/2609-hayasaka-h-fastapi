@@ -1,76 +1,51 @@
-"""担当者に関するAPIのエンドポイントを定義する場所。
+"""担当者の一覧・登録を担当する。入力 → DALで操作 → 応答作成 → 保存確定。"""
 
-- GET /assignees：担当者を一覧取得する。
-- POST /assignees：担当者を新規作成する。
-"""
+from fastapi import APIRouter, status
+from sqlalchemy.orm import Session
 
-# APIルーター、HTTPエラー、HTTPステータスコードを読み込む。
-from fastapi import APIRouter, HTTPException, status
-
-# UNIQUE制約など、データの整合性に違反した場合の例外を読み込む。
-from sqlalchemy.exc import IntegrityError
-
-# 担当者のデータベース操作を行うデータアクセス層を読み込む。
-# assignee_dalという別名を付け、役割を分かりやすくする。
-from ..DataAccessLayer import assignees as assignee_dal
-
-# リクエストごとのデータベースSessionを受け取る型を読み込む。
-from ..dependencies import DbSession
-
-# リクエストとレスポンスのデータ形式を読み込む。
+from ..DataAccessLayer.database import Database, execute_database_operation
+from ..DataAccessLayer.names import AssigneeRepository
 from ..Model.schemas import AssigneeCreate, AssigneeResponse
 
-# 担当者API用のルーターを作成する。
-router = APIRouter(
-    # このルーターのURLには、先頭に/assigneesが付く。
-    prefix="/assignees",
-    # Swagger UIでassigneesグループとして表示する。
-    tags=["assignees"],
-)
 
+class AssigneeController:
+    """SQLはDALへ任せ、処理の順序と応答形式をここでそろえる。"""
 
-# GET /assigneesを定義する。
-@router.get(
-    # prefixと組み合わせて「/assignees」になる。
-    "",
-    # レスポンスがAssigneeResponseのリストであることを指定する。
-    response_model=list[AssigneeResponse],
-)
-def list_assignees(
-    # FastAPIの依存性注入によってSessionを受け取る。
-    db: DbSession,
-):
-    # データアクセス層へ一覧取得処理を依頼し、その結果を返す。
-    return assignee_dal.get_assignees(db)
-
-
-# POST /assigneesを定義する。
-@router.post(
-    # prefixと組み合わせて「/assignees」になる。
-    "",
-    # 作成した担当者をAssigneeResponse形式で返す。
-    response_model=AssigneeResponse,
-    # 作成成功時のHTTPステータスコードを201にする。
-    status_code=status.HTTP_201_CREATED,
-)
-def create_assignee(
-    # リクエスト本文をAssigneeCreateで検証して受け取る。
-    payload: AssigneeCreate,
-    # FastAPIの依存性注入によってSessionを受け取る。
-    db: DbSession,
-):
-    try:
-        # データアクセス層へ担当者の作成処理を依頼する。
-        return assignee_dal.create_assignee(db, payload)
-
-    # 名前の重複など、データベースの制約違反を処理する。
-    except IntegrityError:
-        # 失敗したトランザクションを取り消し、
-        # Sessionを再び使用できる状態に戻す。
-        db.rollback()
-
-        # 同じ名前がすでに存在することを409エラーとして返す。
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Assignee name already exists",
+    def __init__(self, database: Database) -> None:
+        # 起動時に渡されたDatabaseを共有し、Sessionは各処理の共通関数で作る。
+        self.database = database
+        self.router = APIRouter(prefix="/assignees", tags=["assignees"])
+        self.router.add_api_route(
+            "",
+            self.list_all,
+            name="list_assignees",
+            methods=["GET"],
+            response_model=list[AssigneeResponse],
         )
+        self.router.add_api_route(
+            "",
+            self.create,
+            name="create_assignee",
+            methods=["POST"],
+            response_model=AssigneeResponse,
+            status_code=status.HTTP_201_CREATED,
+        )
+
+    def list_all(self) -> list[AssigneeResponse]:
+        """GET /assignees：Sessionが開いている間に、ID順の一覧を応答へ変換する。"""
+
+        def operation(db: Session) -> list[AssigneeResponse]:
+            records = AssigneeRepository(db).list_all()
+            return [AssigneeResponse.model_validate(record) for record in records]
+
+        return execute_database_operation(self.database, operation)
+
+    def create(self, payload: AssigneeCreate) -> AssigneeResponse:
+        """POST /assignees：登録と応答の検証後、共通関数が保存してSessionを閉じる。"""
+
+        def operation(db: Session) -> AssigneeResponse:
+            record = AssigneeRepository(db).create(payload.name)
+            return AssigneeResponse.model_validate(record)
+
+        # 名前重複は409、その他のDB障害は500へ、共通ハンドラーが変換する。
+        return execute_database_operation(self.database, operation, write=True)

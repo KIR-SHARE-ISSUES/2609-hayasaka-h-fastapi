@@ -1,76 +1,51 @@
-"""カテゴリーに関するAPIのエンドポイントを定義する場所。
+"""カテゴリの一覧・登録を担当する。入力 → DALで操作 → 応答作成 → 保存確定。"""
 
-- GET /categories：カテゴリーを一覧取得する。
-- POST /categories：カテゴリーを新規作成する。
-"""
+from fastapi import APIRouter, status
+from sqlalchemy.orm import Session
 
-# APIルーター、HTTPエラー、HTTPステータスコードを読み込む。
-from fastapi import APIRouter, HTTPException, status
-
-# データベースの制約違反が発生したときの例外を読み込む。
-from sqlalchemy.exc import IntegrityError
-
-# カテゴリーのデータベース操作を担当するモジュールを読み込む。
-# category_dalという別名を付けて、役割を明確にする。
-from ..DataAccessLayer import categories as category_dal
-
-# FastAPIの依存性注入でデータベースSessionを受け取るための型を読み込む。
-from ..dependencies import DbSession
-
-# 入力データと出力データの形式を定義したスキーマを読み込む。
+from ..DataAccessLayer.database import Database, execute_database_operation
+from ..DataAccessLayer.names import CategoryRepository
 from ..Model.schemas import CategoryCreate, CategoryResponse
 
-# カテゴリーAPI専用のルーターを作成する。
-router = APIRouter(
-    # このルーターに定義したURLの先頭へ/categoriesを付ける。
-    prefix="/categories",
-    # Swagger UIでcategoriesグループとして表示する。
-    tags=["categories"],
-)
 
+class CategoryController:
+    """SQLはDALへ任せ、処理の順序と応答形式をここでそろえる。"""
 
-# GET /categoriesを定義する。
-@router.get(
-    # prefixと組み合わせて「/categories」になる。
-    "",
-    # CategoryResponse形式のリストをレスポンスとして返す。
-    response_model=list[CategoryResponse],
-)
-def list_categories(
-    # リクエストごとのデータベースSessionを受け取る。
-    db: DbSession,
-):
-    # データアクセス層へカテゴリーの一覧取得を依頼する。
-    return category_dal.get_categories(db)
-
-
-# POST /categoriesを定義する。
-@router.post(
-    # prefixと組み合わせて「/categories」になる。
-    "",
-    # 作成したカテゴリーをCategoryResponse形式で返す。
-    response_model=CategoryResponse,
-    # 作成成功時のHTTPステータスコードを201にする。
-    status_code=status.HTTP_201_CREATED,
-)
-def create_category(
-    # リクエスト本文をCategoryCreateで検証して受け取る。
-    payload: CategoryCreate,
-    # リクエストごとのデータベースSessionを受け取る。
-    db: DbSession,
-):
-    try:
-        # データアクセス層へカテゴリーの作成を依頼する。
-        return category_dal.create_category(db, payload)
-
-    # 名前の重複など、データベースの制約に違反した場合に実行する。
-    except IntegrityError:
-        # 失敗したデータベース操作を取り消す。
-        # rollback後は同じSessionを再び使用できるようになる。
-        db.rollback()
-
-        # 名前が重複していることをHTTP 409エラーとして返す。
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Category name already exists",
+    def __init__(self, database: Database) -> None:
+        # 起動時に渡されたDatabaseを共有し、Sessionは各処理の共通関数で作る。
+        self.database = database
+        self.router = APIRouter(prefix="/categories", tags=["categories"])
+        self.router.add_api_route(
+            "",
+            self.list_all,
+            name="list_categories",
+            methods=["GET"],
+            response_model=list[CategoryResponse],
         )
+        self.router.add_api_route(
+            "",
+            self.create,
+            name="create_category",
+            methods=["POST"],
+            response_model=CategoryResponse,
+            status_code=status.HTTP_201_CREATED,
+        )
+
+    def list_all(self) -> list[CategoryResponse]:
+        """GET /categories：Sessionが開いている間に、ID順の一覧を応答へ変換する。"""
+
+        def operation(db: Session) -> list[CategoryResponse]:
+            records = CategoryRepository(db).list_all()
+            return [CategoryResponse.model_validate(record) for record in records]
+
+        return execute_database_operation(self.database, operation)
+
+    def create(self, payload: CategoryCreate) -> CategoryResponse:
+        """POST /categories：登録と応答の検証後、共通関数が保存してSessionを閉じる。"""
+
+        def operation(db: Session) -> CategoryResponse:
+            record = CategoryRepository(db).create(payload.name)
+            return CategoryResponse.model_validate(record)
+
+        # 名前重複は409、その他のDB障害は500へ、共通ハンドラーが変換する。
+        return execute_database_operation(self.database, operation, write=True)
